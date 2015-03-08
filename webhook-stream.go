@@ -66,6 +66,7 @@ func client(req *http.Request) (string, chan interface{}) {
 func handleDashboard(w http.ResponseWriter, req *http.Request) {
 	user, pass, ok := req.BasicAuth()
 	if !ok || user != dashboardUser || pass != clientSecret {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Dashboard"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
