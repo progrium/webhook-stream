@@ -1,0 +1,18 @@
+{
+  "name": "webhook-stream",
+  "description": "Collects webhook requests and streams them to trusted clients.",
+  "keywords": [
+    "webhooks",
+    "utility"
+  ],
+  "website": "http://github.com/progrium/webhook-stream",
+  "repository": "http://github.com/progrium/webhook-stream",
+  "success_url": "/",
+  "env": {
+    "BUILDPACK_URL": "https://github.com/kr/heroku-buildpack-go.git",
+    "SECRET": {
+      "description": "A secret.",
+      "generator": "secret"
+    }
+  }
+}
