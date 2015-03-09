@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +29,7 @@ var (
 )
 
 type Endpoint struct {
-	mu   sync.Mutex
+	sync.Mutex
 	path string
 
 	Posts   uint64   `json:"posts"`
@@ -45,14 +47,18 @@ func endpoint(path string) *Endpoint {
 	return e
 }
 
-func client(req *http.Request) (string, chan interface{}) {
+func clientJoin(req *http.Request) (string, chan interface{}) {
 	user, _, _ := req.BasicAuth()
 	ip := req.RemoteAddr
 	forwardedFor := req.Header.Get("X-Forwarded-For")
 	if forwardedFor != "" {
 		ip = forwardedFor
 	}
-	client := fmt.Sprintf("%s@%s", user, ip)
+	portIndex := strings.LastIndex(ip, ":")
+	if portIndex > 0 {
+		ip = ip[:portIndex]
+	}
+	client := fmt.Sprintf("%s@%s%s", user, ip, req.URL.Path)
 	clientsLock.Lock()
 	defer clientsLock.Unlock()
 	ch, exists := clients[client]
@@ -60,7 +66,31 @@ func client(req *http.Request) (string, chan interface{}) {
 		ch = make(chan interface{})
 		clients[client] = ch
 	}
+	e := endpoint(req.URL.Path)
+	e.Lock()
+	defer e.Unlock()
+	e.Clients = append(e.Clients, fmt.Sprintf("%s@%s", user, ip))
 	return client, ch
+}
+
+func clientLeave(endpoint *Endpoint, name string) {
+	clientsLock.Lock()
+	defer clientsLock.Unlock()
+	delete(clients, name)
+	endpoint.Lock()
+	defer endpoint.Unlock()
+	dropClient(endpoint, name)
+}
+
+func dropClient(endpoint *Endpoint, name string) {
+	var index int
+	for i, c := range endpoint.Clients {
+		if c == name {
+			index = i
+			break
+		}
+	}
+	endpoint.Clients = append(endpoint.Clients[:index], endpoint.Clients[index+1:]...)
 }
 
 func handleDashboard(w http.ResponseWriter, req *http.Request) {
@@ -70,40 +100,108 @@ func handleDashboard(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	io.WriteString(w, `<html><body><main></main><script src="https://ajax.googleapis.com/ajax/libs/jquery/2.1.3/jquery.min.js"></script></body></html>`)
+	if req.Header.Get("Upgrade") == "websocket" {
+		websocket.Handler(func(conn *websocket.Conn) {
+			for {
+				endpointsLock.Lock()
+				_, err := conn.Write(append(marshal(endpoints, true), '\n'))
+				endpointsLock.Unlock()
+				if err != nil {
+					return
+				}
+				time.Sleep(1 * time.Second)
+			}
+			conn.Close()
+		}).ServeHTTP(w, req)
+		return
+	}
+	io.WriteString(w, `<html><body><pre></pre><script>
+		l = window.location; p = l.protocol.replace("http", "ws");
+		s = new WebSocket(p+"//"+l.hostname+":"+l.port+l.pathname);
+		s.onmessage = function(event) {
+			document.querySelector("pre").innerHTML = event.data;
+		}
+	</script></body></html>`)
 }
 
 func handleHookEndpoint(w http.ResponseWriter, req *http.Request) {
 	switch req.Method {
 	case "POST":
-		// create object
-		// get endpoint
-		// iterate over clients
-		// drop closed clients
-		// return ok
+		var obj interface{}
+		switch req.Header.Get("Content-Type") {
+		case "application/json":
+			body, err := ioutil.ReadAll(req.Body)
+			if err != nil {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			err = json.Unmarshal(body, &obj)
+			if err != nil {
+				http.Error(w, "Bad JSON", http.StatusBadRequest)
+				return
+			}
+		case "application/x-www-form-urlencoded":
+			err := req.ParseForm()
+			if err != nil {
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+			m := make(map[string]string)
+			for key, _ := range req.Form {
+				m[key] = req.Form.Get(key)
+			}
+			obj = m
+		default:
+			http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+			return
+		}
+		e := endpoint(req.URL.Path)
+		e.Lock()
+		defer e.Unlock()
+		e.Posts += 1
+		for _, client := range e.Clients {
+			clientsLock.Lock()
+			ch, exists := clients[client+req.URL.Path]
+			clientsLock.Unlock()
+			if !exists {
+				defer dropClient(e, client)
+				continue
+			}
+			select {
+			case ch <- obj:
+			case <-time.After(time.Second * 1):
+				defer dropClient(e, client)
+				continue
+			}
+		}
 	case "GET":
 		_, pass, ok := req.BasicAuth()
 		if !ok || pass != clientSecret {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		//_, ch := client(req)
+		e := endpoint(req.URL.Path)
+		name, ch := clientJoin(req)
+		defer clientLeave(e, name)
 		if req.Header.Get("Upgrade") == "websocket" {
 			websocket.Handler(func(conn *websocket.Conn) {
-				//for obj := range ch {
-				for {
-					obj := &map[string]string{"Hello": "World"}
-					_, err := conn.Write(append(marshal(obj), '\n'))
+				for obj := range ch {
+					_, err := conn.Write(append(marshal(obj, false), '\n'))
 					if err != nil {
 						return
 					}
-					time.Sleep(3 * time.Second)
 				}
 				conn.Close()
 			}).ServeHTTP(w, req)
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		for obj := range ch {
+			_, err := w.Write(append(marshal(obj, false), '\n'))
+			w.(http.Flusher).Flush()
+			if err != nil {
+				return
+			}
+		}
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -117,8 +215,14 @@ func getopt(name, dfault string) string {
 	return value
 }
 
-func marshal(obj interface{}) []byte {
-	bytes, err := json.MarshalIndent(obj, "", "  ")
+func marshal(obj interface{}, indent bool) []byte {
+	var bytes []byte
+	var err error
+	if indent {
+		bytes, err = json.MarshalIndent(obj, "", "  ")
+	} else {
+		bytes, err = json.Marshal(obj)
+	}
 	if err != nil {
 		log.Println("marshal:", err)
 	}
@@ -139,15 +243,16 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		if req.RequestURI == "/" {
+		switch req.URL.Path {
+		case "/favicon.ico":
+			http.NotFound(w, req)
+		case "/":
 			http.Redirect(w, req, "/dashboard", 301)
-			return
-		}
-		if req.RequestURI == "/dashboard" {
+		case "/dashboard":
 			handleDashboard(w, req)
-			return
+		default:
+			handleHookEndpoint(w, req)
 		}
-		handleHookEndpoint(w, req)
 	})
 
 	log.Printf("webhook-stream %s serving on :%s", Version, port)
